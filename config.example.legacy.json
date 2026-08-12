@@ -1,0 +1,21 @@
+{
+  "port": 8787,
+  "upstreamBaseUrl": "https://api.cerebras.ai/v1",
+  "models": ["gemma-4-31b", "gpt-oss-120b", "zai-glm-4.7"],
+  "requestTimeoutMs": 300000,
+  "adminToken": "",
+  "keys": [
+    {
+      "name": "primary",
+      "apiKey": "csk-YOUR_FIRST_CEREBRAS_KEY",
+      "rpm": 30,
+      "tpm": 30000
+    },
+    {
+      "name": "backup-1",
+      "apiKey": "csk-YOUR_SECOND_CEREBRAS_KEY",
+      "rpm": 30,
+      "tpm": 30000
+    }
+  ]
+}

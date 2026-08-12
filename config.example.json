@@ -1,0 +1,51 @@
+{
+  "port": 8787,
+  "requestTimeoutMs": 300000,
+  "adminToken": "",
+  "routesFile": "routes.json",
+  "upstreams": [
+    {
+      "name": "cerebras",
+      "baseUrl": "https://api.cerebras.ai/v1",
+      "models": ["gemma-4-31b", "gpt-oss-120b", "zai-glm-4.7"],
+      "keys": [
+        {
+          "name": "primary",
+          "apiKey": "csk-YOUR_FIRST_CEREBRAS_KEY",
+          "rpm": 30,
+          "tpm": 30000,
+          "limits": {
+            "gpt-oss-120b": { "rpm": 15, "tpm": 20000 }
+          }
+        },
+        {
+          "name": "backup-1",
+          "apiKey": "csk-YOUR_SECOND_CEREBRAS_KEY",
+          "rpm": 30,
+          "tpm": 30000
+        }
+      ]
+    },
+    {
+      "name": "groq",
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
+      "keys": [
+        {
+          "name": "groq-1",
+          "apiKey": "gsk-YOUR_GROQ_KEY",
+          "rpm": 30,
+          "tpm": 20000
+        }
+      ]
+    }
+  ],
+  "routes": {
+    "chat-fast": { "upstream": "cerebras", "model": "gemma-4-31b" },
+    "llama-70b": {
+      "upstream": "groq",
+      "model": "llama-3.3-70b-versatile",
+      "fallback": { "upstream": "cerebras", "model": "gpt-oss-120b" }
+    }
+  }
+}

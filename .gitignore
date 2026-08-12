@@ -1,0 +1,7 @@
+node_modules/
+config.json
+routes.json
+.env
+*.log
+.freebuff/
+.DS_Store

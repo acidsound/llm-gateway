@@ -1,0 +1,16 @@
+{
+  "name": "llm-gateway",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible gateway that routes to multiple LLM providers, rotating API keys and managing rate limits",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18.17"
+  },
+  "license": "MIT"
+}
