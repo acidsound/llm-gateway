@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { sendJson } from './lib/common.js';
 import { loadConfig } from './lib/config.js';
 import { KeyPool } from './lib/keys.js';
 import { RouteStore } from './lib/routes.js';
@@ -32,7 +33,7 @@ logger.info(
   `Loaded ${upstreams.length} upstream(s): ` +
     upstreams.map((u) => `${u.name} (${u.pool.keys.length} keys, ${u.models.length} models)`).join(', ')
 );
-logger.info(`Routes: ${proxy.availableModels().join(', ')}`);
+logger.info(`Routes: ${routeStore.availableModels().join(', ')}`);
 logger.info(`Config file: ${config.configPath}`);
 logger.info(`Runtime routes file: ${config.routesFile}`);
 if (!config.adminToken) {
@@ -71,17 +72,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && pathname === '/v1/models') {
       // Synthesize the model catalog from routes — callers see exactly what they can use.
-      const models = proxy.availableModels();
-      res.writeHead(200, {
-        'content-type': 'application/json',
-        'access-control-allow-origin': '*',
+      const models = routeStore.availableModels();
+      sendJson(res, 200, {
+        object: 'list',
+        data: models.map((id) => ({ id, object: 'model', created: 0, owned_by: 'proxy' })),
       });
-      res.end(
-        JSON.stringify({
-          object: 'list',
-          data: models.map((id) => ({ id, object: 'model', created: 0, owned_by: 'proxy' })),
-        })
-      );
       return;
     }
     if (pathname.startsWith('/v1/')) {
@@ -89,14 +84,12 @@ const server = http.createServer(async (req, res) => {
       logger.info(`${req.method} ${pathname} -> ${res.statusCode} (${Date.now() - start}ms)`);
       return;
     }
-    res.writeHead(404, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: `Not found: ${pathname}`, type: 'not_found', code: 404 } }));
+    sendJson(res, 404, { error: { message: `Not found: ${pathname}`, type: 'not_found', code: 404 } });
   } catch (err) {
     const status = err.statusCode || 500;
     logger.error(`request ${req.method} ${pathname} failed: ${err.stack || err.message}`);
     if (!res.headersSent) {
-      res.writeHead(status, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: err.message, type: 'proxy_error', code: status } }));
+      sendJson(res, status, { error: { message: err.message, type: 'proxy_error', code: status } });
     } else {
       res.destroy();
     }
@@ -123,13 +116,12 @@ function handleHealth(res) {
 
 function handleStats(req, reqUrl, res) {
   if (!isAuthorized(req, reqUrl)) {
-    res.writeHead(401, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ error: { message: 'Unauthorized', type: 'unauthorized', code: 401 } }));
+    sendJson(res, 401, { error: { message: 'Unauthorized', type: 'unauthorized', code: 401 } });
     return;
   }
   const body = {
     now: new Date().toISOString(),
-    availableModels: proxy.availableModels(),
+    availableModels: routeStore.availableModels(),
     routes: routeStore.list(),
     upstreams: upstreams.map((u) => ({
       name: u.name,

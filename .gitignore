@@ -5,3 +5,4 @@ routes.json
 *.log
 .freebuff/
 .DS_Store
+.aider*
