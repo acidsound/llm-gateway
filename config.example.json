@@ -3,6 +3,7 @@
   "requestTimeoutMs": 300000,
   "adminToken": "",
   "routesFile": "routes.json",
+  "keyHealthFile": "key-health.json",
   "upstreams": [
     {
       "name": "cerebras",
@@ -38,14 +39,37 @@
           "tpm": 20000
         }
       ]
+    },
+    {
+      "name": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "adapter": "anthropic",
+      "models": ["claude-sonnet-4-20250514"],
+      "keys": [
+        {
+          "name": "anth-1",
+          "apiKey": "sk-ant-YOUR_ANTHROPIC_KEY",
+          "rpm": 50,
+          "tpm": 40000
+        }
+      ]
     }
   ],
   "routes": {
     "chat-fast": { "upstream": "cerebras", "model": "gemma-4-31b" },
-    "llama-70b": {
+    "llama-*": {
       "upstream": "groq",
       "model": "llama-3.3-70b-versatile",
-      "fallback": { "upstream": "cerebras", "model": "gpt-oss-120b" }
+      "fallbacks": [
+        { "upstream": "cerebras", "model": "gpt-oss-120b" }
+      ]
+    },
+    "claude": {
+      "upstream": "anthropic",
+      "model": "claude-sonnet-4-20250514",
+      "fallbacks": [
+        { "upstream": "cerebras", "model": "gpt-oss-120b" }
+      ]
     }
   }
 }

@@ -1,4 +1,6 @@
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
 import { sendJson } from './lib/common.js';
 import { loadConfig } from './lib/config.js';
 import { KeyPool } from './lib/keys.js';
@@ -16,6 +18,25 @@ const config = loadConfig();
 const logger = createLogger(process.env.LOG_LEVEL || 'info');
 
 const upstreams = config.upstreams.map((u) => ({ ...u, pool: new KeyPool(u.keys) }));
+
+// Restore key health (disabled keys) from the previous run.
+{
+  const healthFile = config.keyHealthFile;
+  if (fs.existsSync(healthFile)) {
+    try {
+      const saved = JSON.parse(fs.readFileSync(healthFile, 'utf8'));
+      let restored = 0;
+      for (const u of upstreams) {
+        const entries = saved[u.name];
+        if (entries) restored += u.pool.importHealth(entries);
+      }
+      if (restored > 0) logger.info(`Restored ${restored} disabled key(s) from ${healthFile}`);
+    } catch (err) {
+      logger.warn(`Failed to restore key health from ${healthFile}: ${err.message}`);
+    }
+  }
+}
+
 const routeStore = new RouteStore({
   upstreams,
   initialRoutes: config.routes,
@@ -81,7 +102,6 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname.startsWith('/v1/')) {
       await proxy.handle(req, res);
-      logger.info(`${req.method} ${pathname} -> ${res.statusCode} (${Date.now() - start}ms)`);
       return;
     }
     sendJson(res, 404, { error: { message: `Not found: ${pathname}`, type: 'not_found', code: 404 } });
@@ -141,6 +161,16 @@ server.listen(config.port, () => {
 
 function shutdown(signal) {
   logger.info(`received ${signal}, shutting down`);
+  // Persist key health so disabled keys stay dead across restarts.
+  try {
+    const out = {};
+    for (const u of upstreams) out[u.name] = u.pool.exportHealth();
+    const tmp = `${config.keyHealthFile}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2) + '\n');
+    fs.renameSync(tmp, config.keyHealthFile);
+  } catch (err) {
+    logger.warn(`Failed to persist key health: ${err.message}`);
+  }
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(1), 5000).unref();
 }

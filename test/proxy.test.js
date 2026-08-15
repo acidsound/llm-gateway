@@ -329,7 +329,7 @@ test('falls back to another provider when the primary provider is exhausted', as
       chat: {
         upstream: 'cerebras',
         model: 'gemma-4-31b',
-        fallback: { upstream: 'groq', model: 'llama-3.3-70b-versatile' },
+        fallbacks: [{ upstream: 'groq', model: 'llama-3.3-70b-versatile' }],
       },
     }
   );
@@ -391,4 +391,119 @@ test('stops retrying after a 401 and disables the invalid key', async () => {
     proxy.server.close();
     fake.server.close();
   }
+});
+
+test('glob route patterns match model names with wildcards', async () => {
+  const { RouteStore } = await import('../lib/routes.js');
+  const fake = await startFakeUpstream();
+  const pool = new KeyPool([{ name: 'k1', apiKey: 'csk-A', rpm: 10, tpm: 10_000 }]);
+  const upstreams = [{ name: 'up1', baseUrl: `http://127.0.0.1:${fake.port}/v1`, pool }];
+  const store = new RouteStore({
+    upstreams,
+    initialRoutes: {
+      'llama-*': { upstream: 'up1', model: 'llama-3.3-70b', fallbacks: [] },
+      'exact-model': { upstream: 'up1', model: 'gemma-4-31b', fallbacks: [] },
+    },
+    logger,
+  });
+  const proxy = new UpstreamProxy({ upstreams, routes: store, logger, timeoutMs: 5000 });
+  const server = http.createServer((req, res) => proxy.handle(req, res).catch(() => { res.writeHead(500); res.end('err'); }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    // Exact match takes priority
+    const r1 = await post(server.address().port, '/v1/chat/completions', { model: 'exact-model', messages: [] });
+    assert.equal(r1.status, 200);
+    assert.equal(fake.calls[0].body.model, 'gemma-4-31b');
+
+    // Glob match
+    const r2 = await post(server.address().port, '/v1/chat/completions', { model: 'llama-3.1-8b-instant', messages: [] });
+    assert.equal(r2.status, 200);
+    assert.equal(fake.calls[1].body.model, 'llama-3.3-70b', 'glob should rewrite to the route target model');
+
+    // No match
+    const r3 = await post(server.address().port, '/v1/chat/completions', { model: 'gpt-4', messages: [] });
+    assert.equal(r3.status, 400);
+  } finally {
+    server.close();
+    fake.server.close();
+  }
+});
+
+test('fallback chain tries targets in order', async () => {
+  const fakeA = await startFakeUpstream({ badAuth: new Set(['Bearer csk-A1']) });
+  const fakeB = await startFakeUpstream({ badAuth: new Set(['Bearer csk-B1']) });
+  const fakeC = await startFakeUpstream();
+  const poolA = new KeyPool([{ name: 'a1', apiKey: 'csk-A1', rpm: 10, tpm: 10_000 }]);
+  const poolB = new KeyPool([{ name: 'b1', apiKey: 'csk-B1', rpm: 10, tpm: 10_000 }]);
+  const poolC = new KeyPool([{ name: 'c1', apiKey: 'csk-C1', rpm: 10, tpm: 10_000 }]);
+  const proxy = await makeProxyServer(
+    [
+      { name: 'upA', baseUrl: `http://127.0.0.1:${fakeA.port}/v1`, pool: poolA },
+      { name: 'upB', baseUrl: `http://127.0.0.1:${fakeB.port}/v1`, pool: poolB },
+      { name: 'upC', baseUrl: `http://127.0.0.1:${fakeC.port}/v1`, pool: poolC },
+    ],
+    {
+      chat: {
+        upstream: 'upA',
+        model: 'gemma-4-31b',
+        fallbacks: [
+          { upstream: 'upB', model: 'llama-3.3-70b-versatile' },
+          { upstream: 'upC', model: 'gpt-oss-120b' },
+        ],
+      },
+    }
+  );
+  try {
+    const r = await post(proxy.port, '/v1/chat/completions', { model: 'chat', messages: [] });
+    assert.equal(r.status, 200);
+    assert.equal(fakeA.calls.length, 1, 'primary tried once');
+    assert.equal(fakeB.calls.length, 1, 'first fallback tried once');
+    assert.equal(fakeC.calls.length, 1, 'second fallback serves');
+    assert.equal(fakeC.calls[0].body.model, 'gpt-oss-120b');
+    assert.equal(r.headers.get('x-proxy-key'), 'upC/c1');
+  } finally {
+    proxy.server.close();
+    fakeA.server.close();
+    fakeB.server.close();
+    fakeC.server.close();
+  }
+});
+
+test('anthropic adapter uses x-api-key auth', async () => {
+  const fake = await startFakeUpstream();
+  const pool = new KeyPool([{ name: 'k1', apiKey: 'sk-ant-TEST', rpm: 10, tpm: 10_000 }]);
+  const proxy = await makeProxyServer(
+    [{ name: 'anthropic', baseUrl: `http://127.0.0.1:${fake.port}`, adapter: { auth: 'x-api-key', pathPrefix: '/v1', extraHeaders: { 'anthropic-version': '2023-06-01' } }, pool }],
+    { 'claude-3': { upstream: 'anthropic', model: 'claude-3-sonnet', fallbacks: [] } }
+  );
+  try {
+    const r = await post(proxy.port, '/v1/chat/completions', { model: 'claude-3', messages: [] });
+    assert.equal(r.status, 200);
+    // The fake upstream records the authorization header; with x-api-key auth
+    // the key goes in x-api-key instead.
+    assert.equal(fake.calls[0].auth, '', 'no authorization header for x-api-key auth');
+  } finally {
+    proxy.server.close();
+    fake.server.close();
+  }
+});
+
+test('key health export/import preserves disabled state', async () => {
+  const pool = new KeyPool([
+    { name: 'good', apiKey: 'k1', rpm: 10, tpm: 10_000 },
+    { name: 'bad', apiKey: 'k2', rpm: 10, tpm: 10_000 },
+  ]);
+  pool.markInvalid(pool.keys[1], 'test disable');
+  const snapshot = pool.exportHealth();
+  assert.equal(snapshot[1].disabled, true);
+
+  const pool2 = new KeyPool([
+    { name: 'good', apiKey: 'k1', rpm: 10, tpm: 10_000 },
+    { name: 'bad', apiKey: 'k2', rpm: 10, tpm: 10_000 },
+  ]);
+  const restored = pool2.importHealth(snapshot);
+  assert.equal(restored, 1);
+  assert.ok(pool2.keys[1].disabled);
+  assert.equal(pool2.keys[1].disabledReason, 'test disable');
+  assert.ok(!pool2.keys[0].disabled);
 });

@@ -24,9 +24,9 @@ test('RouteStore: set/get/delete/list', () => {
   store.set('chat-2', {
     upstream: 'groq',
     model: 'llama-3.3-70b-versatile',
-    fallback: 'cerebras/gpt-oss-120b',
+    fallbacks: ['cerebras/gpt-oss-120b'],
   });
-  assert.equal(store.get('chat-2').fallback.upstream, 'cerebras');
+  assert.equal(store.get('chat-2').fallbacks[0].upstream, 'cerebras');
   assert.deepEqual(store.availableModels(), ['chat-2', 'chat-fast']);
 
   assert.equal(store.delete('chat-fast'), true);
