@@ -1,6 +1,6 @@
 # llm-gateway
 
-복수 개의 **OpenAI 호환 API 엔드포인트**(Cerebras, Groq, Together 등)를 하나의 단일 엔드포인트로 통합하고, rate limit 을 피해 가용한 키로 라우팅하는 프록시입니다.
+복수 개의 **LLM API 프로바이더**(Cerebras, Anthropic, Groq, Together 등)를 하나의 단일 OpenAI 호환 엔드포인트로 통합하고, rate limit 을 피해 가용한 키로 라우팅하는 프록시입니다.
 
 백엔드는 프록시를 **하나의 OpenAI 호환 엔드포인트**로 보면 됩니다. 프록시가 내부적으로 ① 호출자의 모델명에 따라 provider 를 선택하고, ② 해당 provider 의 가용 키를 골라 rate limit 을 관리합니다.
 
@@ -17,17 +17,21 @@
 ## 주요 기능
 
 - **단일 OpenAI 호환 엔드포인트** — `/v1/*` 경로 그대로 프록시. `chat/completions`, `completions`, `embeddings` 지원. 백엔드는 `base_url` 만 바꾸면 됩니다.
+- **멀티 프로바이더 어댑터** — `openai`(기본), `anthropic`, `google` 프리셋 + 커스텀 인라인 어댑터. 인증 스타일(`bearer`/`x-api-key`), URL prefix, 추가 헤더를 프로바이더별로 설정.
 - **모델명 기반 라우팅** — 호출자의 `model` 필드가 어떤 provider 의 어떤 모델로 갈지 `routes` 로 정의. provider 마다 모델명이 달라도 **호출자 모델명을 provider 실제 모델명으로 재작성**해서 전달.
+- **Glob 라우트 매칭** — `"llama-*"`, `"claude-*"` 같은 와일드카드 패턴으로 모델 그룹을 한 번에 라우팅. 정확 매칭이 우선, 그 다음 가장 긴 패턴이 이김.
 - **`/v1/models` 카탈로그 합성** — 라우트 가능한 모델명만 반환. 호출자는 프록시가 제공하는 모델명만 쓰면 됩니다.
 - **키 로테이션** — provider 내에서 **가장 여유 있는 키**(RPM/TPM 사용률 기준) 선택, 실패 시 다음 키로 자동 재시도.
 - **Rate limit 관리 (모델별)**
   - 60초 슬라이딩 윈도우로 **(키, 모델)별** 요청 수(RPM)와 대략적 토큰 수(TPM) 추적 — rate limit 은 provider·모델마다 다름
   - 429 응답 시 `retry-after` 존중 cooldown, 없으면 지수 백오프. **429 는 해당 (키, 모델)만** cooldown
   - 5xx/네트워크 오류는 모델과 무관한 장애이므로 **키 전체** cooldown
-  - 응답의 `x-ratelimit-remaining-*` 헤더 관찰로 남은 할당량 0이면 미리 cooldown
+  - 응답의 rate-limit 헤더(프로바이더별 커스터마이즈 가능) 관찰로 남은 할당량 0이면 미리 cooldown
   - 모든 키가 소진되면 클라이언트에 429 + `Retry-After` 반환
-- **Provider fallback** — primary provider 의 키가 전부 소진/장애면 라우트에 정의된 fallback provider 로 전환.
-- **장애 처리** — 429/5xx/네트워크 오류는 다른 키로 재시도, **401(무효 키)은 영구 제외**(재시작 시 복구), 4xx(클라이언트 오류)는 키를 소모하지 않고 그대로 전달.
+- **Provider fallback 체인** — primary provider 의 키가 전부 소진/장애면 `fallbacks[]` 순서대로 다음 프로바이더로 전환. 여러 레벨의 폴백을 정의할 수 있음.
+- **Key health 영속화** — 401(무효 키) 등으로 disable 된 키 상태를 `key-health.json`에 저장. 재시작 후에도 유지.
+- **Structured JSON 로깅** — 요청당 한 줄 JSON 로그(`ts, requestId, method, model, upstream, key, error, status, latencyMs`). 파이프라인/관제 연동 용이.
+- **장애 처리** — 429/5xx/네트워크 오류는 다른 키로 재시도, **401(무효 키)은 영구 제외**(재시작 시 `key-health.json` 에서 복구), 4xx(클라이언트 오류)는 키를 소모하지 않고 그대로 전달.
 - **스트리밍(SSE) 지원** — `stream: true` 응답을 그대로 파이프. 클라이언트 연결이 끊기면 업스트림도 중단.
 - **운영용 엔드포인트** — `/health`(probe 용), `/stats`(provider·키·모델별 상세, ADMIN_TOKEN 보호).
 - **제로 의존성** — Node.js 내장 모듈만. `npm install` 불필요.
@@ -47,6 +51,7 @@
   "port": 8787,
   "requestTimeoutMs": 300000,
   "adminToken": "your-ops-token",
+  "keyHealthFile": "./key-health.json",
   "upstreams": [
     {
       "name": "cerebras",
@@ -58,8 +63,18 @@
       ]
     },
     {
+      "name": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "adapter": "anthropic",
+      "models": ["claude-sonnet-4-20250514"],
+      "keys": [
+        { "name": "anth-1", "apiKey": "sk-ant-XXX", "rpm": 50, "tpm": 100000 }
+      ]
+    },
+    {
       "name": "groq",
-      "baseUrl": "https://api.groq.com/openai/v1",
+      "baseUrl": "https://api.groq.com",
+      "adapter": { "auth": "bearer", "pathPrefix": "/openai/v1" },
       "models": ["llama-3.3-70b-versatile"],
       "keys": [
         { "name": "groq-1", "apiKey": "gsk-ZZZ", "rpm": 30, "tpm": 20000 }
@@ -68,10 +83,15 @@
   ],
   "routes": {
     "chat-fast": { "upstream": "cerebras", "model": "gemma-4-31b" },
+    "llama-*": { "upstream": "groq" },
+    "claude-*": { "upstream": "anthropic" },
     "llama-70b": {
       "upstream": "groq",
       "model": "llama-3.3-70b-versatile",
-      "fallback": { "upstream": "cerebras", "model": "gpt-oss-120b" }
+      "fallbacks": [
+        { "upstream": "cerebras", "model": "gpt-oss-120b" },
+        { "upstream": "anthropic", "model": "claude-sonnet-4-20250514" }
+      ]
     }
   }
 }
@@ -80,7 +100,8 @@
 **라우팅 규칙:**
 - `upstreams[].models` 에 나열된 모델은 **자동으로 동일 이름 라우트**가 생성됩니다(호출자 모델명 = provider 모델명). 예: `"gemma-4-31b"` → cerebras 의 `gemma-4-31b`.
 - `routes` 에 명시한 항목이 우선입니다. 자동 라우트를 덮어쓰거나 **별칭**(`chat-fast` → cerebras/`gemma-4-31b`)을 추가할 수 있습니다.
-- `routes` 값 형식: `"provider/model"` 문자열 또는 `{ "upstream", "model", "fallback"? }`.
+- **Glob 패턴** — `*` 포함 키는 와일드카드 매칭. `"llama-*"` 는 `llama-3.3-70b-versatile`, `llama-3.1-8b` 등 모든 `llama-` 시작 모델에 매칭. 정확 매칭이 우선하고, 여러 패턴이 매칭되면 가장 긴 패턴이 이김.
+- `routes` 값 형식: `"provider/model"` 문자열 또는 `{ "upstream", "model", "fallbacks"? }`.
 - 라우트에 없는 모델명으로 요청이 오면 `400` 과 함께 사용 가능한 모델 목록을 반환합니다.
 
 **레거시 형식**(단일 provider, `upstreamBaseUrl` + `keys`)도 그대로 동작합니다. `config.example.legacy.json` 참고.
@@ -130,9 +151,54 @@ const client = new OpenAI({
 | 필드 | 설명 |
 |---|---|
 | `name` | provider 식별자 (라우트/로그/헤더에 사용) |
-| `baseUrl` | OpenAI 호환 베이스 URL (예: `https://api.cerebras.ai/v1`) |
+| `baseUrl` | 프로바이더 베이스 URL (예: `https://api.cerebras.ai/v1`) |
+| `adapter` | 프로바이더 어댑터 (아래 참고). 기본값: `"openai"` |
 | `models` | 이 provider 가 제공하는 모델 목록. 여기서 자동 라우트가 생성됨 |
 | `keys[]` | 키 목록. 각 키: `name`, `apiKey`, `rpm`, `tpm`, `limits`(모델별 오버라이드) |
+| `rateLimitHeaders` | rate-limit 헤더명 커스터마이즈 (아래 참고) |
+
+### 프로바이더 어댑터 (`adapter`)
+
+프로바이더마다 인증 방식과 URL 구조가 다릅니다. `adapter` 필드로 설정합니다.
+
+**프리셋:**
+
+| 값 | 인증 | 설명 |
+|---|---|---|
+| `"openai"` (기본) | `Authorization: Bearer <key>` | OpenAI 호환 API (Cerebras, Groq, Together 등) |
+| `"anthropic"` | `x-api-key: <key>` + `anthropic-version` | Anthropic API |
+| `"google"` | `x-goog-api-key: <key>` | Google Gemini API |
+
+**커스텀 인라인:**
+
+```json
+"adapter": {
+  "auth": "x-api-key",
+  "pathPrefix": "/v1",
+  "extraHeaders": { "X-Custom": "value" }
+}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `auth` | `"bearer"` (기본) 또는 `"x-api-key"` 등 커스텀 헤더명 |
+| `pathPrefix` | `baseUrl` 뒤에 붙을 경로 prefix (예: `"/openai/v1"`) |
+| `extraHeaders` | 매 요청에 추가할 고정 헤더 |
+
+**URL 구성:** `baseUrl + pathPrefix + /chat/completions`
+- `baseUrl` 이 이미 `/v1` 로 끝나면 `pathPrefix` 가 중복되지 않도록 자동 처리
+- 예: `baseUrl: "https://api.groq.com"` + `pathPrefix: "/openai/v1"` → `https://api.groq.com/openai/v1/chat/completions`
+
+### rate-limit 헤더 (`rateLimitHeaders`)
+
+프로바이더마다 rate-limit 관련 헤더명이 다릅니다. 기본값은 `x-ratelimit-remaining-reqs` / `x-ratelimit-remaining-tokens`.
+
+```json
+"rateLimitHeaders": {
+  "remainingRequests": "x-my-remaining-reqs",
+  "remainingTokens": "x-my-remaining-tokens"
+}
+```
 
 ### routes
 
@@ -140,7 +206,24 @@ const client = new OpenAI({
 |---|---|
 | `"cerebras/gemma-4-31b"` | `upstream` + `/` + `model` |
 | `{ "upstream": "cerebras", "model": "gemma-4-31b" }` | 위와 동일 |
-| `{ ..., "fallback": { "upstream": "groq", "model": "llama-..." } }` | primary provider 소진 시 fallback |
+| `{ ..., "fallbacks": [{ "upstream": "groq", "model": "llama-..." }] }` | primary 소진 시 순서대로 폴백 |
+| `{ ..., "fallback": { "upstream": "groq" } }` | 레거시 단일 폴백 (자동 `fallbacks` 로 변환) |
+| `"llama-*"` (키) | Glob 패턴 — `llama-` 로 시작하는 모든 모델 매칭 |
+
+**Fallback 체인 예시:**
+
+```json
+"llama-70b": {
+  "upstream": "groq",
+  "model": "llama-3.3-70b-versatile",
+  "fallbacks": [
+    { "upstream": "cerebras", "model": "gpt-oss-120b" },
+    { "upstream": "anthropic", "model": "claude-sonnet-4-20250514" }
+  ]
+}
+```
+
+순서대로 시도: groq → cerebras → anthropic. 각 단계에서 키가 전부 소진/장애면 다음으로 넘어감.
 
 ### 모델별 rate limit (키의 `limits`)
 
@@ -170,6 +253,7 @@ rate limit 이 모델마다 다르면 키별로 지정할 수 있습니다. 미�
 | `ADMIN_TOKEN` | 없음 | `/stats` 보호 (`Authorization: Bearer <token>` 또는 `?token=`) |
 | `CONFIG_PATH` | `./config.json` | 설정 파일 경로 |
 | `ROUTES_FILE` | `./routes.json` | 런타임 라우트 영속화 파일 (관리 API 변경분) |
+| `KEY_HEALTH_FILE` | `./key-health.json` | 키 health 상태 영속화 파일 |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `UPSTREAM_KEYS` / `UPSTREAM_BASE_URL` | — | **레거시 형식**에서만 사용 (쉼표 구분 키 목록 / 베이스 URL) |
 
@@ -215,14 +299,15 @@ curl -X DELETE http://localhost:8787/admin/routes/chat-fast
 
 ## 동작 방식
 
-1. 요청의 `model` 필드로 라우트를 결정합니다. 라우트에 없으면 400.
+1. 요청의 `model` 필드로 라우트를 결정합니다. 정확 매칭 → glob 패턴(가장 긴 우선) 순서. 없으면 400.
 2. 라우트의 provider 를 찾아, body 의 model 을 provider 실제 모델명으로 재작성합니다.
 3. provider 의 키 풀에서 60초 윈도우 기준 **사용률이 가장 낮은** ready 키 선택 (동률이면 라운드로빈).
 4. 429/5xx/네트워크 오류면 해당 키 cooldown 후 **다음 키로 재시도** (키당 요청당 1회).
 5. 401 이면 키 영구 제외. 4xx(400 등)는 재시도 없이 그대로 전달.
-6. provider 의 키가 전부 소진되면 **fallback provider 로 전환**.
-7. 모든 provider 실패 시 `429`(+`Retry-After`) 또는 `503` 을 OpenAI 오류 형식으로 반환.
+6. provider 의 키가 전부 소진되면 **fallbacks 체인 순서대로** 다음 프로바이더로 전환.
+7. 모든 프로바이더 실패 시 `429`(+`Retry-After`) 또는 `503` 을 OpenAI 오류 형식으로 반환.
 8. 스트리밍은 시작 전에만 재시도 판단, 시작 후엔 그대로 파이프.
+9. 요청 완료 시 structured JSON 로그 기록 (requestId, latency, upstream, key, status).
 
 ## 운영
 
@@ -244,12 +329,33 @@ docker run -d --name llm-gateway -p 8787:8787 -v "$PWD/config.json:/app/config.j
 
 - `config.json` 에 실제 키가 있으면 `.gitignore` / `.dockerignore` 로 반드시 제외하세요(기본 포함).
 - `ADMIN_TOKEN` 을 반드시 설정하세요. 미설정 시 `/admin/*` 과 `/stats` 가 인증 없이 노출됩니다(시작 시 경고 로그).
-- 401 키는 프로세스 재시작 전까지 제외 상태로 남습니다. 키 교체 후 재시작하세요.
+- 401 키는 `key-health.json` 에 영속화되어 재시작 후에도 제외 상태로 남습니다. 키 교체 후 해당 파일을 삭제하거나 재시작하세요.
 - fallback 은 primary provider 가 **완전히 소진**됐을 때만 동작합니다(부분 실패는 키 로테이션으로 처리).
+- 어댑터는 인증 헤더/URL만 변환합니다. 요청 body 는 OpenAI 호환 포맷 그대로 전달되므로, Anthropic 등 body 형식이 다른 프로바이더는 body 변환이 필요합니다(미구현).
+
+## 로깅
+
+각 요청은 한 줄 JSON 로깅됩니다 (stdout):
+
+```json
+{"ts":"2026-08-15T09:49:00.123Z","requestId":"a1b2c3","method":"POST","path":"/v1/chat/completions","model":"chat-fast","upstream":"cerebras","key":"primary","error":null,"status":200,"latencyMs":342}
+```
+
+| 필드 | 설명 |
+|---|---|
+| `requestId` | 6자 hex ID (응답 헤더 `x-request-id` 로도 반환) |
+| `model` | 호출자가 요청한 모델명 |
+| `upstream` | 실제 응답한 프로바이더 이름 |
+| `key` | 사용된 키 이름 |
+| `error` | 실패 시 에러 메시지, 성공 시 `null` |
+| `status` | HTTP 응답 상태 코드 |
+| `latencyMs` | 요청 시작부터 응답 완료까지(ms) |
+
+`LOG_LEVEL=debug` 로 키 선택/cooldown 상세 로그를 추가할 수 있습니다.
 
 ## 테스트
 
-가짜 업스트림 서버로 로테이션·스트리밍·모델별 rate limit·다중 provider 라우팅·별칭 재작성·fallback·무효 키 케이스를 검증합니다.
+가짜 업스트림 서버로 로테이션·스트리밍·모델별 rate limit·다중 provider 라우팅·별칭 재작성·fallback 체인·glob 매칭·anthropic 어댑터·key health 영속화 케이스를 검증합니다.
 
 ```bash
 npm test
