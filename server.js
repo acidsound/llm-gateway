@@ -83,7 +83,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
-    if (req.method === 'GET' && pathname === '/health') {
+    if (req.method === 'GET' && (pathname === '/' || pathname === '/health')) {
       handleHealth(res);
       return;
     }
@@ -91,7 +91,15 @@ const server = http.createServer(async (req, res) => {
       handleStats(req, reqUrl, res);
       return;
     }
-    if (req.method === 'GET' && pathname === '/v1/models') {
+    if (req.method === 'GET' && (pathname === '/v1' || pathname === '/v1/')) {
+      sendJson(res, 200, {
+        status: 'ok',
+        message: 'llm-gateway is running',
+        availableModels: routeStore.availableModels(),
+      });
+      return;
+    }
+    if (req.method === 'GET' && (pathname === '/v1/models' || pathname === '/v1/models/' || pathname === '/models')) {
       // Synthesize the model catalog from routes — callers see exactly what they can use.
       const models = routeStore.availableModels();
       sendJson(res, 200, {
