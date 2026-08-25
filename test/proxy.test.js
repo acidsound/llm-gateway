@@ -89,8 +89,8 @@ function makeProxyServer(upstreams, routes) {
 }
 
 /** Single-upstream helper with identity routes for the given models (plus extra routes). */
-function startProxy(pool, upstreamBaseUrl, { models = DEFAULT_MODELS, routes = {} } = {}) {
-  const upstreams = [{ name: 'up1', baseUrl: upstreamBaseUrl, pool }];
+function startProxy(pool, upstreamBaseUrl, { models = DEFAULT_MODELS, routes = {}, upstreamOpts = {} } = {}) {
+  const upstreams = [{ name: 'up1', baseUrl: upstreamBaseUrl, pool, ...upstreamOpts }];
   const allRoutes = { ...routes };
   for (const m of models) if (!allRoutes[m]) allRoutes[m] = { upstream: 'up1', model: m };
   return makeProxyServer(upstreams, allRoutes);
@@ -365,13 +365,13 @@ test('availableModels returns the routed model catalog', async () => {
   }
 });
 
-test('stops retrying after a 401 and disables the invalid key', async () => {
+test('stops retrying after a 401 and disables the invalid key (unauthorizedPolicy: disable)', async () => {
   const fake = await startFakeUpstream({ invalidAuth: new Set(['Bearer csk-BAD', 'Bearer csk-BAD2']) });
   const pool = new KeyPool([
     { name: 'bad1', apiKey: 'csk-BAD', rpm: 10, tpm: 10_000 },
     { name: 'bad2', apiKey: 'csk-BAD2', rpm: 10, tpm: 10_000 },
   ]);
-  const proxy = await startProxy(pool, `http://127.0.0.1:${fake.port}/v1`);
+  const proxy = await startProxy(pool, `http://127.0.0.1:${fake.port}/v1`, { upstreamOpts: { unauthorizedPolicy: 'disable' } });
   try {
     const r = await post(proxy.port, '/v1/chat/completions', {
       model: 'llama-3.3-70b',
@@ -386,6 +386,36 @@ test('stops retrying after a 401 and disables the invalid key', async () => {
       messages: [{ role: 'user', content: 'hi' }],
     });
     assert.equal(r2.status, 503);
+    assert.equal(fake.calls.length, 2);
+  } finally {
+    proxy.server.close();
+    fake.server.close();
+  }
+});
+
+test('relaxes 401 by default: cooldowns the key instead of permanently disabling it', async () => {
+  const fake = await startFakeUpstream({ invalidAuth: new Set(['Bearer csk-BAD', 'Bearer csk-BAD2']) });
+  const pool = new KeyPool([
+    { name: 'bad1', apiKey: 'csk-BAD', rpm: 10, tpm: 10_000 },
+    { name: 'bad2', apiKey: 'csk-BAD2', rpm: 10, tpm: 10_000 },
+  ]);
+  const proxy = await startProxy(pool, `http://127.0.0.1:${fake.port}/v1`);
+  try {
+    const r = await post(proxy.port, '/v1/chat/completions', {
+      model: 'llama-3.3-70b',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(fake.calls.length, 2, 'both keys should be tried');
+    assert.ok(!pool.keys[0].disabled && !pool.keys[1].disabled, 'no key should be permanently disabled');
+    assert.ok(pool.keys[0].cooldownUntil > Date.now(), 'key should be in whole-key cooldown after 401');
+    assert.ok(pool.keys[1].cooldownUntil > Date.now(), 'other key should also be in whole-key cooldown');
+
+    // Immediately after: keys are still cooling down -> 429 with no new upstream call.
+    const r2 = await post(proxy.port, '/v1/chat/completions', {
+      model: 'llama-3.3-70b',
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    assert.equal(r2.status, 429);
     assert.equal(fake.calls.length, 2);
   } finally {
     proxy.server.close();

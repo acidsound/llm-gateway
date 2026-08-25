@@ -25,13 +25,13 @@
 - **Rate limit 관리 (모델별)**
   - 60초 슬라이딩 윈도우로 **(키, 모델)별** 요청 수(RPM)와 대략적 토큰 수(TPM) 추적 — rate limit 은 provider·모델마다 다름
   - 429 응답 시 `retry-after` 존중 cooldown, 없으면 지수 백오프. **429 는 해당 (키, 모델)만** cooldown
-  - 5xx/네트워크 오류는 모델과 무관한 장애이므로 **키 전체** cooldown
+  - 5xx/네트워크 오류는 모델과 무관한 장애이므로 **키 전체** cooldown, 402(할당량/과금 소진)도 키 전체 cooldown
   - 응답의 rate-limit 헤더(프로바이더별 커스터마이즈 가능) 관찰로 남은 할당량 0이면 미리 cooldown
   - 모든 키가 소진되면 클라이언트에 429 + `Retry-After` 반환
 - **Provider fallback 체인** — primary provider 의 키가 전부 소진/장애면 `fallbacks[]` 순서대로 다음 프로바이더로 전환. 여러 레벨의 폴백을 정의할 수 있음.
-- **Key health 영속화** — 401(무효 키) 등으로 disable 된 키 상태를 `key-health.json`에 저장. 재시작 후에도 유지.
+- **Key health 영속화** — `unauthorizedPolicy: "disable"` 로 영구 제외된 키 상태를 `key-health.json`에 저장. 재시작 후에도 유지.
 - **Structured JSON 로깅** — 요청당 한 줄 JSON 로그(`ts, requestId, method, model, upstream, key, error, status, latencyMs`). 파이프라인/관제 연동 용이.
-- **장애 처리** — 429/5xx/네트워크 오류는 다른 키로 재시도, **401(무효 키)은 영구 제외**(재시작 시 `key-health.json` 에서 복구), 4xx(클라이언트 오류)는 키를 소모하지 않고 그대로 전달.
+- **장애 처리** — 429/5xx/네트워크 오류는 다른 키로 재시도, **402(할당량/과금 소진)는 키 전체 cooldown**, **401 은 기본적으로 완화**(일시적 오류로 보고 키 전체 cooldown 후 재시도, `unauthorizedPolicy: "disable"` 로 영구 제외 가능), 4xx(클라이언트 오류)는 키를 소모하지 않고 그대로 전달.
 - **스트리밍(SSE) 지원** — `stream: true` 응답을 그대로 파이프. 클라이언트 연결이 끊기면 업스트림도 중단.
 - **운영용 엔드포인트** — `/health`(probe 용), `/stats`(provider·키·모델별 상세, ADMIN_TOKEN 보호).
 - **제로 의존성** — Node.js 내장 모듈만. `npm install` 불필요.
@@ -156,6 +156,8 @@ const client = new OpenAI({
 | `models` | 이 provider 가 제공하는 모델 목록. 여기서 자동 라우트가 생성됨 |
 | `keys[]` | 키 목록. 각 키: `name`, `apiKey`, `rpm`, `tpm`, `limits`(모델별 오버라이드) |
 | `rateLimitHeaders` | rate-limit 헤더명 커스터마이즈 (아래 참고) |
+| `stripTools` | 네이티브 tool payload 를 system prompt 의 JSON tool-call 지시로 변환 (아래 참고) |
+| `unauthorizedPolicy` | 401 처리 정책. 기본값 `"cooldown"` (완화), `"disable"` 이면 영구 제외 (아래 참고) |
 
 ### 프로바이더 어댑터 (`adapter`)
 
@@ -167,7 +169,9 @@ const client = new OpenAI({
 |---|---|---|
 | `"openai"` (기본) | `Authorization: Bearer <key>` | OpenAI 호환 API (Cerebras, Groq, Together 등) |
 | `"anthropic"` | `x-api-key: <key>` + `anthropic-version` | Anthropic API |
-| `"google"` | `x-goog-api-key: <key>` | Google Gemini API |
+| `"google"` | `Authorization: Bearer <key>` | Google Gemini API |
+
+> 참고: `google` 프리셋은 현재 코드에서 `bearer` 인증을 사용합니다(README 와 달리 `x-goog-api-key` 가 아닙니다). Gemini 는 `x-goog-api-key` 를 요구하므로 실제로는 커스텀 인라인 어댑터(`{ "auth": "x-goog-api-key" }`)를 사용해야 합니다.
 
 **커스텀 인라인:**
 
@@ -191,12 +195,55 @@ const client = new OpenAI({
 
 ### rate-limit 헤더 (`rateLimitHeaders`)
 
-프로바이더마다 rate-limit 관련 헤더명이 다릅니다. 기본값은 `x-ratelimit-remaining-reqs` / `x-ratelimit-remaining-tokens`.
+프로바이더마다 rate-limit 관련 헤더명이 다릅니다. 기본값은 `x-ratelimit-remaining-requests` / `x-ratelimit-remaining-tokens`.
 
 ```json
 "rateLimitHeaders": {
   "remainingRequests": "x-my-remaining-reqs",
   "remainingTokens": "x-my-remaining-tokens"
+}
+```
+
+### tool-stripping (`stripTools`)
+
+일부 업스트림(예: OpenRouter stealth 모델)은 요청에 `tools` 배열이 포함되면 응답을 `native_finish_reason:"network_error"` 로 종료합니다. `stripTools` 를 켜면 프록시가 `tools`/`tool_choice` 필드를 제거하고, 대신 system prompt 에 JSON 형식의 tool-call 지시를 주입하여 일반 텍스트로 tool call 을 받아냅니다.
+
+```json
+{
+  "name": "openrouter",
+  "baseUrl": "https://openrouter.ai/api/v1",
+  "stripTools": true,
+  "models": ["stealth-v2"],
+  "keys": [ ... ]
+}
+```
+
+`stripTools` 값은 다음 형식을 지원합니다:
+
+| 값 | 의미 |
+|---|---|
+| `true` | 모든 모델에 대해 tool-stripping 활성화 |
+| `{ "default": true, "model-a": false }` | model-a 제외한 모든 모델에 활성 |
+| `{ "default": false, "model-b": true }` | model-b 만 활성화 |
+
+### 401 처리 정책 (`unauthorizedPolicy`)
+
+업스트림이 `401`(인증 실패)을 반환했을 때의 처리 방식을 프로바이더별로 정합니다.
+
+| 값 | 의미 |
+|---|---|
+| `"cooldown"` (기본) | **완화.** 401 을 일시적 오류(인증 불안정/프로바이더 문제)로 보고 키 전체를 짧게 cooldown 후 재시도. 키를 영구 비활성화하지 않음 |
+| `"disable"` | **엄격.** 401 을 무효 키로 판단해 키를 영구 제외하고 `key-health.json` 에 영속화 (레거시 동작) |
+
+기본값은 완화(`"cooldown"`)입니다. 키가 진짜 무효임이 확실한 프로바이더에서만 `"disable"` 을 쓰세요.
+
+```json
+{
+  "name": "cerebras",
+  "baseUrl": "https://api.cerebras.ai/v1",
+  "unauthorizedPolicy": "disable",
+  "models": ["gemma-4-31b"],
+  "keys": [ ... ]
 }
 ```
 
@@ -302,8 +349,8 @@ curl -X DELETE http://localhost:8787/admin/routes/chat-fast
 1. 요청의 `model` 필드로 라우트를 결정합니다. 정확 매칭 → glob 패턴(가장 긴 우선) 순서. 없으면 400.
 2. 라우트의 provider 를 찾아, body 의 model 을 provider 실제 모델명으로 재작성합니다.
 3. provider 의 키 풀에서 60초 윈도우 기준 **사용률이 가장 낮은** ready 키 선택 (동률이면 라운드로빈).
-4. 429/5xx/네트워크 오류면 해당 키 cooldown 후 **다음 키로 재시도** (키당 요청당 1회).
-5. 401 이면 키 영구 제외. 4xx(400 등)는 재시도 없이 그대로 전달.
+4. 429/5xx/네트워크 오류면 해당 키 cooldown 후 **다음 키로 재시도** (키당 요청당 1회). 402 는 키 전체 cooldown 후 재시도.
+5. 401 은 기본적으로 완화(키 전체 cooldown 후 재시도). `unauthorizedPolicy: "disable"` 이면 키 영구 제외. 4xx(400 등)는 재시도 없이 그대로 전달.
 6. provider 의 키가 전부 소진되면 **fallbacks 체인 순서대로** 다음 프로바이더로 전환.
 7. 모든 프로바이더 실패 시 `429`(+`Retry-After`) 또는 `503` 을 OpenAI 오류 형식으로 반환.
 8. 스트리밍은 시작 전에만 재시도 판단, 시작 후엔 그대로 파이프.
@@ -323,13 +370,13 @@ docker run -d --name llm-gateway -p 8787:8787 -v "$PWD/config.json:/app/config.j
 - `/health` 를 주기적으로 probe 하여 provider·키 가용성을 추적하세요.
 - `/stats` 로 provider별 키의 `state`, 모델별 `utilization`, `total429s`, `total5xx` 를 확인하세요.
 - `/admin/routes` 로 현재 라우팅 구성을 확인하고, 운영 중 라우트를 조정하세요.
-- 로그의 `rate limited (429) on model "..."` / `permanently disabled: invalid API key (401)` / `provider "..." exhausted; trying fallback` 메시지로 이상 징후를 감지하세요.
+- 로그의 `rate limited (429) on model "..."` / `unauthorized (401) on model "..."` / `permanently disabled: invalid API key (401)` / `provider "..." exhausted; trying fallback` 메시지로 이상 징후를 감지하세요.
 
 ### 주의사항
 
 - `config.json` 에 실제 키가 있으면 `.gitignore` / `.dockerignore` 로 반드시 제외하세요(기본 포함).
 - `ADMIN_TOKEN` 을 반드시 설정하세요. 미설정 시 `/admin/*` 과 `/stats` 가 인증 없이 노출됩니다(시작 시 경고 로그).
-- 401 키는 `key-health.json` 에 영속화되어 재시작 후에도 제외 상태로 남습니다. 키 교체 후 해당 파일을 삭제하거나 재시작하세요.
+- 401 은 기본적으로 완화 처리되므로 키가 영구 제외되지 않습니다. `unauthorizedPolicy: "disable"` 을 쓴 프로바이더에서만 `key-health.json` 에 영속화되어 재시작 후에도 제외 상태로 남습니다. 키 교체 후 해당 파일을 삭제하거나 재시작하세요.
 - fallback 은 primary provider 가 **완전히 소진**됐을 때만 동작합니다(부분 실패는 키 로테이션으로 처리).
 - 어댑터는 인증 헤더/URL만 변환합니다. 요청 body 는 OpenAI 호환 포맷 그대로 전달되므로, Anthropic 등 body 형식이 다른 프로바이더는 body 변환이 필요합니다(미구현).
 
@@ -338,12 +385,12 @@ docker run -d --name llm-gateway -p 8787:8787 -v "$PWD/config.json:/app/config.j
 각 요청은 한 줄 JSON 로깅됩니다 (stdout):
 
 ```json
-{"ts":"2026-08-15T09:49:00.123Z","requestId":"a1b2c3","method":"POST","path":"/v1/chat/completions","model":"chat-fast","upstream":"cerebras","key":"primary","error":null,"status":200,"latencyMs":342}
+{"ts":"2026-08-15T09:49:00.123Z","requestId":"9f2c1e4a-8b3d-4e6f-9a2c-5d8b1f0e7c34","method":"POST","path":"/v1/chat/completions","model":"chat-fast","upstream":"cerebras","key":"primary","error":null,"status":200,"latencyMs":342}
 ```
 
 | 필드 | 설명 |
 |---|---|
-| `requestId` | 6자 hex ID (응답 헤더 `x-request-id` 로도 반환) |
+| `requestId` | UUID (응답 헤더 `x-request-id` 로도 반환) |
 | `model` | 호출자가 요청한 모델명 |
 | `upstream` | 실제 응답한 프로바이더 이름 |
 | `key` | 사용된 키 이름 |
