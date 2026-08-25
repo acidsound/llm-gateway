@@ -537,3 +537,57 @@ test('key health export/import preserves disabled state', async () => {
   assert.equal(pool2.keys[1].disabledReason, 'test disable');
   assert.ok(!pool2.keys[0].disabled);
 });
+
+test('sticky mode keeps reusing one healthy key instead of rotating (cache warmth)', async () => {
+  const fake = await startFakeUpstream();
+  const pool = new KeyPool(
+    [
+      { name: 'a', apiKey: 'csk-A', rpm: 10, tpm: 10_000 },
+      { name: 'b', apiKey: 'csk-B', rpm: 10, tpm: 10_000 },
+    ],
+    { sticky: true }
+  );
+  const proxy = await startProxy(pool, `http://127.0.0.1:${fake.port}/v1`);
+  try {
+    for (let i = 0; i < 5; i++) {
+      const r = await post(proxy.port, '/v1/chat/completions', { model: 'llama-3.3-70b', messages: [{ role: 'user', content: 'hi' }] });
+      assert.equal(r.status, 200);
+    }
+    const auths = fake.calls.map((c) => c.auth);
+    // Every request hits the same single key -> the first key sticks.
+    assert.equal(auths.length, 5);
+    assert.ok(auths.every((a) => a === auths[0]), `expected all requests on one key, got ${auths.join(', ')}`);
+    assert.equal(pool.preferred.get('llama-3.3-70b'), 0);
+  } finally {
+    proxy.server.close();
+    fake.server.close();
+  }
+});
+
+test('sticky mode rotates only when the preferred key starts failing', async () => {
+  const fake = await startFakeUpstream({ badAuth: new Set(['Bearer csk-A']) });
+  const pool = new KeyPool(
+    [
+      { name: 'a', apiKey: 'csk-A', rpm: 10, tpm: 10_000 },
+      { name: 'b', apiKey: 'csk-B', rpm: 10, tpm: 10_000 },
+    ],
+    { sticky: true }
+  );
+  const proxy = await startProxy(pool, `http://127.0.0.1:${fake.port}/v1`);
+  try {
+    // First request: key A is tried, gets 429 (badAuth), so key B serves and becomes preferred.
+    const r1 = await post(proxy.port, '/v1/chat/completions', { model: 'llama-3.3-70b', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r1.status, 200);
+    assert.equal(r1.headers.get('x-proxy-key'), 'up1/b');
+    assert.equal(pool.preferred.get('llama-3.3-70b'), 1, 'sticky should pin to the key that succeeded (B)');
+
+    // Second request: A is cooling, B is preferred and healthy -> straight to B, no rotation.
+    const r2 = await post(proxy.port, '/v1/chat/completions', { model: 'llama-3.3-70b', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(r2.status, 200);
+    assert.equal(fake.calls.length, 3, 'one retry on A then B for req1, plus just B for req2');
+    assert.equal(fake.calls[2].auth, 'Bearer csk-B', 'should reuse B without re-trying A');
+  } finally {
+    proxy.server.close();
+    fake.server.close();
+  }
+});
