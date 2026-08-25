@@ -591,3 +591,28 @@ test('sticky mode rotates only when the preferred key starts failing', async () 
     fake.server.close();
   }
 });
+
+test('sticky mode keeps the preferred key even when saturated, as long as it is not cooling (utilization is a local heuristic, not a real limit)', () => {
+  const pool = new KeyPool(
+    [
+      { name: 'a', apiKey: 'csk-A', rpm: 2, tpm: 10_000 },
+      { name: 'b', apiKey: 'csk-B', rpm: 2, tpm: 10_000 },
+    ],
+    { sticky: true }
+  );
+  // Pin the model to key A (the "warm" key).
+  pool.preferred.set('llama-3.3-70b', 0);
+  // Fill A's RPM window to saturation — but NOT cooling.  The provider keeps
+  // returning 200 (the RPM window is only a local estimate), so sticky should
+  // stay on the warm key rather than rotate.
+  for (let i = 0; i < 2; i++) pool.recordRequestStart(pool.keys[0], 'llama-3.3-70b', 100);
+  assert.equal(pool.isCooling(pool.keys[0], 'llama-3.3-70b'), false, 'precondition: A is saturated but not cooling');
+  assert.equal(pool.utilization(pool.keys[0], 'llama-3.3-70b'), 1, 'precondition: A is at 100% utilization');
+
+  const sel = pool.select([], 'llama-3.3-70b');
+  // As long as the preferred key is healthy (not cooling, not disabled), it
+  // stays pinned.  Utilization alone is not a reason to rotate — only real
+  // upstream failures are.
+  assert.equal(sel.key.index, 0, 'should stay on the warm key A even at 100% utilization');
+  assert.equal(pool.preferred.get('llama-3.3-70b'), 0, 'sticky should not re-pin away from a healthy key');
+});

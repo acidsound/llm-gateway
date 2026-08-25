@@ -8,7 +8,6 @@
     {
       "name": "cerebras",
       "baseUrl": "https://api.cerebras.ai/v1",
-      "sticky": false,
       "models": ["gemma-4-31b", "gpt-oss-120b", "zai-glm-4.7"],
       "keys": [
         {

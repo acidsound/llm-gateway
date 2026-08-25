@@ -17,7 +17,7 @@ if (typeof fetch !== 'function') {
 const config = loadConfig();
 const logger = createLogger(process.env.LOG_LEVEL || 'info');
 
-const upstreams = config.upstreams.map((u) => ({ ...u, pool: new KeyPool(u.keys, { sticky: u.sticky === true }) }));
+const upstreams = config.upstreams.map((u) => ({ ...u, pool: new KeyPool(u.keys, { sticky: u.sticky }) }));
 
 // Restore key health (disabled keys) from the previous run.
 {
