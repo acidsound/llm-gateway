@@ -39,6 +39,38 @@ test('RouteStore: rejects unknown upstreams', () => {
   assert.throws(() => store.set('x', { upstream: 'nope', model: 'm' }), /unknown upstream/);
 });
 
+test('RouteStore: catalog reflects upstream names', () => {
+  const store = new RouteStore({ upstreams: UPSTREAMS, initialRoutes: {}, logger });
+  store.set('model-a', { upstream: 'cerebras', model: 'gemma-4-31b' });
+  store.set('model-b', {
+    upstream: 'cerebras',
+    model: 'gpt-oss-120b',
+    fallbacks: [{ upstream: 'groq', model: 'llama-3.3-70b-versatile' }],
+  });
+  store.set('model-c', {
+    upstream: 'groq',
+    model: 'llama-3.3-70b-versatile',
+    fallbacks: [
+      { upstream: 'groq', model: 'other-model' },   // same upstream deduped
+      { upstream: 'cerebras', model: 'gemma-4-31b' },
+    ],
+  });
+
+  const cat = store.catalog();
+  assert.equal(cat.length, 3);
+  assert.equal(cat[0].id, 'model-a');
+  assert.equal(cat[0].owned_by, 'cerebras');
+  assert.equal(cat[1].id, 'model-b');
+  assert.equal(cat[1].owned_by, 'cerebras, groq');
+  assert.equal(cat[2].id, 'model-c');
+  assert.equal(cat[2].owned_by, 'groq, cerebras');
+  // Standard OpenAI shape
+  for (const entry of cat) {
+    assert.equal(entry.object, 'model');
+    assert.equal(entry.created, 0);
+  }
+});
+
 test('RouteStore: persists and reloads routes', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-'));
   const file = path.join(dir, 'routes.json');

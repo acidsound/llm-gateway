@@ -101,11 +101,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (pathname === '/v1/models' || pathname === '/v1/models/' || pathname === '/models')) {
       // Synthesize the model catalog from routes — callers see exactly what they can use.
-      const models = routeStore.availableModels();
-      sendJson(res, 200, {
-        object: 'list',
-        data: models.map((id) => ({ id, object: 'model', created: 0, owned_by: 'proxy' })),
-      });
+      // owned_by reflects the upstream(s) behind each route (primary + distinct fallbacks).
+      sendJson(res, 200, { object: 'list', data: routeStore.catalog() });
       return;
     }
     if (pathname.startsWith('/v1/')) {
