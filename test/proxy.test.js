@@ -365,6 +365,37 @@ test('availableModels returns the routed model catalog', async () => {
   }
 });
 
+test('proxy records model usage so the catalog orders by recency', async () => {
+  const { RouteStore } = await import('../lib/routes.js');
+  const fake = await startFakeUpstream();
+  const pool = new KeyPool([{ name: 'k1', apiKey: 'csk-A', rpm: 10, tpm: 10_000 }]);
+  const upstreams = [{ name: 'up1', baseUrl: `http://127.0.0.1:${fake.port}/v1`, pool }];
+  const store = new RouteStore({
+    upstreams,
+    initialRoutes: {
+      'gemma-4-31b': { upstream: 'up1', model: 'gemma-4-31b' },
+      'chat-fast': { upstream: 'up1', model: 'gemma-4-31b' },
+    },
+    logger,
+  });
+  const proxy = new UpstreamProxy({ upstreams, routes: store, logger, timeoutMs: 5000 });
+  const server = http.createServer((req, res) => proxy.handle(req, res).catch(() => { res.writeHead(500); res.end('err'); }));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  try {
+    // No usage yet -> alphabetical.
+    assert.deepEqual(store.catalog().map((m) => m.id), ['chat-fast', 'gemma-4-31b']);
+
+    await post(server.address().port, '/v1/chat/completions', { model: 'gemma-4-31b', messages: [] });
+    assert.deepEqual(store.catalog().map((m) => m.id), ['gemma-4-31b', 'chat-fast']);
+
+    await post(server.address().port, '/v1/chat/completions', { model: 'chat-fast', messages: [] });
+    assert.deepEqual(store.catalog().map((m) => m.id), ['chat-fast', 'gemma-4-31b']);
+  } finally {
+    server.close();
+    fake.server.close();
+  }
+});
+
 test('stops retrying after a 401 and disables the invalid key (unauthorizedPolicy: disable)', async () => {
   const fake = await startFakeUpstream({ invalidAuth: new Set(['Bearer csk-BAD', 'Bearer csk-BAD2']) });
   const pool = new KeyPool([

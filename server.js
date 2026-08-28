@@ -45,7 +45,9 @@ const routeStore = new RouteStore({
 });
 const proxy = new UpstreamProxy({
   upstreams,
-  routes: routeStore.routes,
+  // Pass the RouteStore instance (not just the raw map) so the proxy can
+  // record per-model usage for recency-ordered /v1/models catalogs.
+  routes: routeStore,
   logger,
   timeoutMs: config.requestTimeoutMs,
 });

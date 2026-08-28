@@ -71,6 +71,56 @@ test('RouteStore: catalog reflects upstream names', () => {
   }
 });
 
+test('RouteStore: catalog orders by most recently used model', () => {
+  const store = new RouteStore({ upstreams: UPSTREAMS, initialRoutes: {}, logger });
+  store.set('alpha', { upstream: 'cerebras', model: 'gemma-4-31b' });
+  store.set('beta', { upstream: 'groq', model: 'llama-3.3-70b-versatile' });
+  store.set('gamma', { upstream: 'cerebras', model: 'gpt-oss-120b' });
+
+  // Fresh store (nothing used yet) -> alphabetical.
+  assert.deepEqual(store.catalog().map((m) => m.id), ['alpha', 'beta', 'gamma']);
+
+  store.touch('beta', 1000);
+  store.touch('gamma', 2000); // most recent
+  assert.deepEqual(store.catalog().map((m) => m.id), ['gamma', 'beta', 'alpha']);
+
+  store.touch('alpha', 3000);
+  assert.deepEqual(store.catalog().map((m) => m.id), ['alpha', 'gamma', 'beta']);
+
+  // Unknown models are ignored.
+  assert.equal(store.touch('no-such-model', 4000), false);
+  assert.deepEqual(store.catalog().map((m) => m.id), ['alpha', 'gamma', 'beta']);
+});
+
+test('RouteStore: touch resolves glob patterns to the catalog route key', () => {
+  const store = new RouteStore({
+    upstreams: UPSTREAMS,
+    initialRoutes: {
+      'llama-*': { upstream: 'groq', model: 'llama-3.3-70b-versatile' },
+      'gemma-*': { upstream: 'cerebras', model: 'gemma-4-31b' },
+    },
+    logger,
+  });
+  assert.deepEqual(store.catalog().map((m) => m.id), ['gemma-*', 'llama-*']);
+  store.touch('llama-3.1-8b-instant', 1000); // glob match -> touches "llama-*"
+  assert.deepEqual(store.catalog().map((m) => m.id), ['llama-*', 'gemma-*']);
+  // Touching the literal pattern key also works.
+  store.touch('gemma-*', 2000);
+  assert.deepEqual(store.catalog().map((m) => m.id), ['gemma-*', 'llama-*']);
+});
+
+test('RouteStore: deleting a route clears its recency stamp', () => {
+  const store = new RouteStore({ upstreams: UPSTREAMS, initialRoutes: {}, logger });
+  store.set('a', { upstream: 'cerebras', model: 'gemma-4-31b' });
+  store.set('b', { upstream: 'groq', model: 'llama-3.3-70b-versatile' });
+  store.touch('a', 1000);
+  store.touch('b', 2000);
+  store.delete('b');
+  store.set('b', { upstream: 'groq', model: 'llama-3.3-70b-versatile' });
+  // Re-added "b" should NOT inherit the old "most recent" stamp.
+  assert.deepEqual(store.catalog().map((m) => m.id), ['a', 'b']);
+});
+
 test('RouteStore: persists and reloads routes', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'routes-'));
   const file = path.join(dir, 'routes.json');
