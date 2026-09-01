@@ -131,7 +131,13 @@ const server = http.createServer(async (req, res) => {
         return;
       }
     }
-    if (pathname.startsWith('/v1/')) {
+    // Forward only non-GET requests to the LLM proxy. GET on an unknown /v1/*
+    // path (e.g. /v1/props, a llama.cpp server-type probe fired by clients
+    // against a localhost base_url) is NOT an OpenAI endpoint, so it must not
+    // reach the body-reading proxy and come back as a misleading
+    // "The \"model\" field is required" 400 — it should be a clean 404. The
+    // proxy only ever produces a successful result for POST-style LLM calls.
+    if (pathname.startsWith('/v1/') && req.method !== 'GET') {
       await proxy.handle(req, res);
       return;
     }

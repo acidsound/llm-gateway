@@ -26,6 +26,7 @@ async function bootGateway() {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lgw-models-'));
   const cfg = {
+    requestTimeoutMs: 5000,
     upstreams: [
       {
         name: 'bai',
@@ -114,6 +115,49 @@ test('GET /v1/models list is unaffected by the single-model handler', async () =
       body.data.map((m) => m.id).sort(),
       ['deepseek-v4-flash-vision-exp', 'qwen3.8-flash']
     );
+  } finally {
+    gw.kill();
+  }
+});
+
+test('GET /v1/props (a server-type probe, not an OpenAI endpoint) returns a clean 404', async () => {
+  const gw = await bootGateway();
+  try {
+    const res = await fetch(`http://127.0.0.1:${gw.port}/v1/props`);
+    assert.equal(res.status, 404);
+    const body = await res.json();
+    assert.equal(body.error.type, 'not_found');
+    assert.equal(body.error.code, 404);
+  } finally {
+    gw.kill();
+  }
+});
+
+test('GET on a non-GET OpenAI path (e.g. /v1/chat/completions) returns 404, not a misleading 400', async () => {
+  const gw = await bootGateway();
+  try {
+    const res = await fetch(`http://127.0.0.1:${gw.port}/v1/chat/completions`);
+    assert.equal(res.status, 404);
+  } finally {
+    gw.kill();
+  }
+});
+
+test('POST /v1/chat/completions still routes to the proxy (not a 404)', async () => {
+  const gw = await bootGateway();
+  try {
+    const res = await fetch(`http://127.0.0.1:${gw.port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'qwen3.8-flash', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    // The fake upstream (https://fake.example/v1) is unreachable, so the proxy
+    // produces a proxy_error (503/504). What matters: it did NOT return 404,
+    // i.e. the request was forwarded to the proxy rather than rejected.
+    assert.notEqual(res.status, 404);
+    const body = await res.json().catch(() => ({}));
+    assert.ok(body.error);
+    assert.equal(body.error.type, 'proxy_error');
   } finally {
     gw.kill();
   }
