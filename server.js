@@ -107,6 +107,30 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { object: 'list', data: routeStore.catalog() });
       return;
     }
+    if (req.method === 'GET') {
+      // GET /v1/models/{model} (and /models/{model}) — OpenAI single-model retrieval.
+      // Without this the /{model} sub-path falls through to the proxy, which treats the
+      // request as a chat/completions call and demands `model` in the body (400).
+      const modelMatch = pathname.match(/^\/v1\/models\/([^/]+)$/) || pathname.match(/^\/models\/([^/]+)$/);
+      if (modelMatch) {
+        let modelId = modelMatch[1];
+        try { modelId = decodeURIComponent(modelId); } catch { /* keep raw on malformed encoding */ }
+        const entry = routeStore.catalog().find((e) => e.id === modelId);
+        if (entry) {
+          sendJson(res, 200, entry);
+          return;
+        }
+        // A glob route key (e.g. "llama-*") can serve models the caller didn't name verbatim.
+        const key = routeStore.routeKeyFor(modelId);
+        if (key) {
+          const base = routeStore.catalog().find((e) => e.id === key);
+          sendJson(res, 200, { object: 'model', id: modelId, created: 0, owned_by: base ? base.owned_by : 'proxy' });
+          return;
+        }
+        sendJson(res, 404, { error: { message: `Model not found: ${modelId}`, type: 'invalid_request_error', code: 404 } });
+        return;
+      }
+    }
     if (pathname.startsWith('/v1/')) {
       await proxy.handle(req, res);
       return;
